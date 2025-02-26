@@ -756,13 +756,12 @@ impl ImportMap {
     }
 
     fn insert_import(&mut self, import: wasmparser::Import<'_>, item: Import) -> Result<()> {
-        let entry = self
+        let import_instance = self
             .names
             .entry(import.module.to_string())
             .or_insert(ImportInstance::Names(IndexMap::default()));
-        let names = match entry {
-            ImportInstance::Names(names) => names,
-            _ => bail!("cannot mix individual imports with module imports"),
+        let ImportInstance::Names(names) = import_instance else {
+             bail!("cannot mix individual imports with module imports");
         };
         let entry = match names.entry(import.name.to_string()) {
             Entry::Occupied(_) => {

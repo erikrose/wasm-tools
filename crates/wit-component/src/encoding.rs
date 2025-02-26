@@ -2564,7 +2564,7 @@ pub struct ComponentEncoder {
 impl ComponentEncoder {
     /// Set the core module to encode as a component.
     /// This method will also parse any component type information stored in custom sections
-    /// inside the module, and add them as the interface, imports, and exports.
+    /// inside the module and add them as the interface, imports, and exports.
     /// It will also add any producers information inside the component type information to the
     /// core module.
     pub fn module(mut self, module: &[u8]) -> Result<Self> {
