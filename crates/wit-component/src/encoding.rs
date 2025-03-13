@@ -2740,6 +2740,7 @@ impl ComponentEncoder {
     }
 
     /// Encode the component and return the bytes.
+    /// All the other methods are basically setters. This is where the action is. *****************
     pub fn encode(&mut self) -> Result<Vec<u8>> {
         if self.module.is_empty() {
             bail!("a module is required when encoding a component");

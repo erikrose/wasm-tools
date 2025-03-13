@@ -2,6 +2,7 @@ use crate::encoding::{Instance, Item, LibraryInfo, MainOrAdapter};
 use crate::{ComponentEncoder, StringEncoding};
 use anyhow::{bail, Context, Result};
 use indexmap::{map::Entry, IndexMap, IndexSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::mem;
 use wasm_encoder::ExportKind;
@@ -75,6 +76,7 @@ impl ValidatedModule {
                 }
                 Payload::ImportSection(s) => {
                     for import in s {
+                        // Here's where we can see all the imports.
                         let import = import?;
                         ret.imports.add(import, encoder, info, types)?;
                     }
@@ -95,6 +97,12 @@ impl ValidatedModule {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportPath {
+    module: String,
+    name: String,
+}
+
 /// Metadata information about a module's imports.
 ///
 /// This structure maintains the connection between component model "things" and
@@ -106,12 +114,37 @@ pub struct ImportMap {
     /// and the second level of the map is the field namespace. The item is then
     /// how the import is satisfied.
     names: IndexMap<String, ImportInstance>,
+    /// A map of duplicate import module/name pairs to their canonical values.
+    ///
+    /// Core wasm modules allow multiple imports to have the same module/name pair,
+    /// with those imports capable of being disambiguated by index or type, at
+    /// the discretion of the embedder. Components, however, interlink
+    /// only by name, making disambiguation impossible. We thus arbitrarily
+    /// resolve duplicate module/name pairs as pointing to the first of that
+    /// pair.
+    // XXX: This is nonsense. Need $j, $k, … pointing to the canonical $i (or whatever the encoding phase references imports by).
+    //duplicate_names: HashMap<ImportPath, ImportPath>,
+
+    /// A map of <A, B>, meaning "Import A should be passed symbol B." For
+    /// example, to eliminate duplicate imports of fd_write, this might
+    /// contain...
+    ///
+    ///     ("wasi_snapshot_preview1", "fd_write" )  -> ("wasi_snapshot_preview1", "fd_write")
+    ///     ("wasi_snapshot_preview1", "fd_write_2") -> ("wasi_snapshot_preview1", "fd_write")
+    ///
+    /// Core wasm modules allow multiple imports to have the same module/name pair,
+    /// with those imports capable of being disambiguated by index or type, at
+    /// the discretion of the embedder. Components, however, interlink
+    /// only by name, making disambiguation impossible. Thus, we rename all but
+    /// the first of any repeated module/name pairs and do some fakery to ensure
+    /// they receive equivalent bindings.
+    deduplications: HashMap<ImportPath, ImportPath>,
 }
 
 pub enum ImportInstance {
     /// This import is satisfied by an entire instance of another
     /// adapter/module.
-    Whole(MainOrAdapter),
+    Whole(MainOrAdapter), // TODO: Make sure it's not possible for the symbols imported by whole-module imports to collide with name-based ones--because I'm tracking only name-based ones in the deduplication map atm. Maybe it's not: search for "cannot mix individual imports and whole module imports".
 
     /// This import is satisfied by filling out each name possibly differently.
     Names(IndexMap<String, Import>),
@@ -478,6 +511,8 @@ impl ImportMap {
         self.insert_import(import, item)
     }
 
+    /// Determines what kind of thing is being imported: map it from the
+    /// module/name/type triple in the raw wasm module to an enum.
     fn classify(
         &self,
         import: wasmparser::Import<'_>,
@@ -714,6 +749,7 @@ impl ImportMap {
         )
     }
 
+    /// What do I do?
     fn classify_import_with_library(
         &mut self,
         import: wasmparser::Import<'_>,
@@ -755,30 +791,74 @@ impl ImportMap {
         Ok(true)
     }
 
+    /// Renders a module/name pair unique in the deduplication map by coming up
+    /// with a new name if necessary.
+    ///
+    /// In order to remain both human-readable and deterministic, we keep the
+    /// original name if possible and add a suffix if not.
+    fn maybe_new_name(&self, path: &ImportPath) -> Result<String> {
+        if !self.deduplications.contains_key(path) {
+            return Ok(path.name.clone());
+        }
+        let max_name_length: usize = u32::MAX.try_into()?; // according to wasm spec
+        let mut new_path = path.clone();
+
+        // No particular need to limit this to u32::MAX, but if we had that many
+        // duplicates, I'd rather hear about it and think harder about what to
+        // do.
+        for suffix_number in 0..u32::MAX {
+            new_path.name = format!("{}_{}", path.name, suffix_number);
+            if new_path.name.len() > max_name_length {
+                bail!("exceeded maximum import-name length while searching for a unique name for duplicated import {}::{}.", path.module, path.name);
+            }
+            if !self.deduplications.contains_key(&new_path) {
+                return Ok(new_path.name);
+            }
+        }
+        bail!(
+            "couldn't find a unique name for duplicated import {}::{}.",
+            path.module,
+            path.name
+        );
+    }
+
     fn insert_import(&mut self, import: wasmparser::Import<'_>, item: Import) -> Result<()> {
+        let import_module = import.module.to_string();
         let import_instance = self
             .names
-            .entry(import.module.to_string())
+            .entry(import_module.clone())
             .or_insert(ImportInstance::Names(IndexMap::default()));
-        let ImportInstance::Names(names) = import_instance else {
-             bail!("cannot mix individual imports with module imports");
+        // The only other place names get added to self.names is in
+        // classify_import_with_library(), but those are only whole-module
+        // imports, which we assert are mutually exclusive with the named ones
+        // this handles. Thus, checking for duplicates here suffices.
+        let ImportInstance::Names(_) = import_instance else {
+            bail!("cannot mix individual imports with module imports");
         };
-        let entry = match names.entry(import.name.to_string()) {
-            Entry::Occupied(_) => {
-                bail!(
-                    "module has duplicate import for `{}::{}`",
-                    import.module,
-                    import.name
-                );
-            }
-            Entry::Vacant(v) => v,
+        let original_path = ImportPath {
+            module: import_module.clone(),
+            name: import.name.to_string(),
+        };
+        let unique_name = self.maybe_new_name(&original_path)?;
+        self.deduplications.insert(
+            ImportPath {
+                module: import_module.clone(),
+                name: unique_name.clone(),
+            },
+            original_path,
+        );
+
+        // Redo some of this work from above so maybe_new_name() can borrow self.
+        let import_instance = self.names.get_mut(&import_module).unwrap();
+        let ImportInstance::Names(names) = import_instance else {
+            unreachable!()
         };
         log::trace!(
             "classifying import `{}::{} as {item:?}",
             import.module,
             import.name
         );
-        entry.insert(item);
+        names.insert(unique_name, item);
         Ok(())
     }
 }

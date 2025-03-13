@@ -169,6 +169,7 @@ impl NewOpts {
 
     /// Executes the application.
     fn run(self) -> Result<()> {
+        // `wasm-tools component new` entrypoint
         let wasm = self.io.parse_input_wasm()?;
         let mut encoder = ComponentEncoder::default()
             .validate(!self.skip_validation)
@@ -180,7 +181,7 @@ impl NewOpts {
         encoder = encoder.module(&wasm)?;
 
         for (name, wasm) in self.adapters.iter() {
-            encoder = encoder.adapter(name, wasm)?;
+            encoder = encoder.adapter(name, wasm)?; // Adapters are just like libraries, except they have no data sections or elements. Libraries are just like modules, except they have no memories or tables and use the ones of their victims.
         }
 
         encoder = encoder.realloc_via_memory_grow(self.realloc_via_memory_grow);
