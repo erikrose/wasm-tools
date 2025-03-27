@@ -97,6 +97,8 @@ impl ValidatedModule {
     }
 }
 
+/// A module/name pair that identifies a deeply imported symbol. (It cannot
+/// represent an import satisfied by an ImportInstance::Whole.)
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ImportPath {
     module: String,
@@ -458,6 +460,15 @@ impl ImportMap {
         };
         names
             .iter()
+            // No need for the adapter to export renamed symbols like
+            // fd_write_0, fd_write_1, etc., which were added to mask duplicate
+            // imports.
+            .filter(|(inner_name, _)| {
+                !self.contains_duplicate(&ImportPath {
+                    module: name.to_owned(),
+                    name: inner_name.to_string(),
+                })
+            })
             .map(|(name, import)| {
                 (
                     name.clone(),
@@ -791,13 +802,34 @@ impl ImportMap {
         Ok(true)
     }
 
-    /// Renders a module/name pair unique in the deduplication map by coming up
-    /// with a new name if necessary.
+    /// Returns whether this ImportMap has the given import, either originally
+    /// or as a new name generated to work around a duplicate.
+    ///
+    /// No "whole instance" imports can contribute to a true result from this,
+    /// since ImportPaths have no way to refer to them.
+    fn contains(&self, path: &ImportPath) -> bool {
+        let contains_non_duplicate = match self.names.get(&path.module) {
+            None | Some(ImportInstance::Whole(_)) => false,
+            Some(ImportInstance::Names(inner_names)) => inner_names.contains_key(&path.name),
+            // NEXT: Go over to world.rs
+        };
+        self.contains_duplicate(&path) || contains_non_duplicate
+    }
+
+    /// Returns whether the given import path represents a new name generated to
+    /// avoid a duplicate name.
+    fn contains_duplicate(&self, path: &ImportPath) -> bool {
+        self.deduplications.contains_key(path)
+    }
+
+    /// Renders a module/name pair unique in this ImportMap by coming up with a
+    /// new name if necessary. If a new name is made, it is added to
+    /// self.deduplications.
     ///
     /// In order to remain both human-readable and deterministic, we keep the
     /// original name if possible and add a suffix if not.
-    fn maybe_new_name(&self, path: &ImportPath) -> Result<String> {
-        if !self.deduplications.contains_key(path) {
+    fn deduplicate_name(&mut self, path: &ImportPath) -> Result<String> {
+        if !self.contains(path) {
             return Ok(path.name.clone());
         }
         let max_name_length: usize = u32::MAX.try_into()?; // according to wasm spec
@@ -811,7 +843,8 @@ impl ImportMap {
             if new_path.name.len() > max_name_length {
                 bail!("exceeded maximum import-name length while searching for a unique name for duplicated import {}::{}.", path.module, path.name);
             }
-            if !self.deduplications.contains_key(&new_path) {
+            if !self.contains(&new_path) {
+                self.deduplications.insert(new_path.clone(), path.clone());
                 return Ok(new_path.name);
             }
         }
@@ -839,16 +872,10 @@ impl ImportMap {
             module: import_module.clone(),
             name: import.name.to_string(),
         };
-        let unique_name = self.maybe_new_name(&original_path)?;
-        self.deduplications.insert(
-            ImportPath {
-                module: import_module.clone(),
-                name: unique_name.clone(),
-            },
-            original_path,
-        );
+        let unique_name = self.deduplicate_name(&original_path)?;
 
-        // Redo some of this work from above so maybe_new_name() can borrow self.
+        // Redo some of this work from above so deduplicate_name() can borrow self.
+        // TODO: See if this is still necessary now that we're mut borrowing.
         let import_instance = self.names.get_mut(&import_module).unwrap();
         let ImportInstance::Names(names) = import_instance else {
             unreachable!()

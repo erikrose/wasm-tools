@@ -1581,7 +1581,7 @@ impl<'a> EncodingState<'a> {
                 // For import modules that are a "bag of names" iterate over
                 // each name and materialize it into this component with the
                 // `materialize_import` helper. This is then all bottled up into
-                // a bag-of-exports instances which is then used for
+                // a bag-of-exports instance which is then used for
                 // instantiation.
                 ImportInstance::Names(names) => {
                     let mut exports = Vec::new();
@@ -1660,7 +1660,7 @@ impl<'a> EncodingState<'a> {
                 return Ok((ExportKind::Func, index));
             }
 
-            // Adapters might uset he main module's memory, in which case it
+            // Adapters might use the main module's memory, in which case it
             // should have been previously instantiated.
             Import::MainModuleMemory => {
                 let index = self
