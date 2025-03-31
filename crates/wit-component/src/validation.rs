@@ -463,10 +463,10 @@ impl ImportMap {
             // No need for the adapter to export renamed symbols like
             // fd_write_0, fd_write_1, etc., which were added to mask duplicate
             // imports.
-            .filter(|(inner_name, _)| {
+            .filter(|(field, _)| {
                 !self.contains_duplicate(&ImportPath {
                     module: name.to_owned(),
-                    name: inner_name.to_string(),
+                    name: field.to_string(),
                 })
             })
             .map(|(name, import)| {
@@ -500,6 +500,14 @@ impl ImportMap {
     /// Returns the map for how all imports must be satisfied.
     pub fn modules(&self) -> &IndexMap<String, ImportInstance> {
         &self.names
+    }
+
+    /// Return the original name of a deduplicated import path or, if `path` was
+    /// not the result of a deduplication, `path.name` unchanged.
+    pub fn original_name(&self, module: String, name: String) -> String {
+        let path = ImportPath { module, name };
+        let original_path = self.deduplications.get(&path).unwrap_or(&path);
+        original_path.name.clone()
     }
 
     /// Helper function used during validation to build up this `ImportMap`.
@@ -810,8 +818,7 @@ impl ImportMap {
     fn contains(&self, path: &ImportPath) -> bool {
         let contains_non_duplicate = match self.names.get(&path.module) {
             None | Some(ImportInstance::Whole(_)) => false,
-            Some(ImportInstance::Names(inner_names)) => inner_names.contains_key(&path.name),
-            // NEXT: Go over to world.rs
+            Some(ImportInstance::Names(fields)) => fields.contains_key(&path.name),
         };
         self.contains_duplicate(&path) || contains_non_duplicate
     }
@@ -828,7 +835,7 @@ impl ImportMap {
     ///
     /// In order to remain both human-readable and deterministic, we keep the
     /// original name if possible and add a suffix if not.
-    fn deduplicate_name(&mut self, path: &ImportPath) -> Result<String> {
+    fn deduplicated_name(&mut self, path: &ImportPath) -> Result<String> {
         if !self.contains(path) {
             return Ok(path.name.clone());
         }
@@ -872,9 +879,9 @@ impl ImportMap {
             module: import_module.clone(),
             name: import.name.to_string(),
         };
-        let unique_name = self.deduplicate_name(&original_path)?;
+        let unique_name = self.deduplicated_name(&original_path)?;
 
-        // Redo some of this work from above so deduplicate_name() can borrow self.
+        // Redo some of this work from above so deduplicated_name() can borrow self.
         // TODO: See if this is still necessary now that we're mut borrowing.
         let import_instance = self.names.get_mut(&import_module).unwrap();
         let ImportInstance::Names(names) = import_instance else {

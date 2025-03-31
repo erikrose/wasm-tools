@@ -100,6 +100,7 @@ impl<'a> ComponentWorld<'a> {
         ) in self.encoder.adapters.iter()
         {
             let required_by_import = self.info.imports.required_from_adapter(name.as_str());
+            // Don't require things like fd_write_0: only the original names.
             let no_required_by_import = || required_by_import.is_empty();
             let no_required_exports = || {
                 required_exports
