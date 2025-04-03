@@ -1576,8 +1576,7 @@ impl<'a> EncodingState<'a> {
         let module = self.module_for(for_module);
 
         let mut args = Vec::new();
-        let imports = self.info.imports_for(for_module);
-        for (core_wasm_name, instance) in imports.modules() {
+        for (core_wasm_name, instance) in self.info.imports_for(for_module).modules() {
             match instance {
                 // For import modules that are a "bag of names" iterate over
                 // each name and materialize it into this component with the
@@ -1587,26 +1586,14 @@ impl<'a> EncodingState<'a> {
                 ImportInstance::Names(names) => {
                     let mut exports = Vec::new();
                     for (name, import) in names {
-                        let original_import_name =
-                            imports.original_name(core_wasm_name.clone(), name.clone());
                         let (kind, index) = self
-                            .materialize_import(
-                                &shims,
-                                for_module,
-                                core_wasm_name,
-                                &original_import_name,
-                                import,
-                            )
+                            .materialize_import(&shims, for_module, core_wasm_name, name, import)
                             .with_context(|| {
                                 format!("failed to satisfy import `{core_wasm_name}::{name}`")
                             })?;
-                        exports.push((original_import_name, kind, index)); // NEXT: Well, changing to the original name here and in materialize_import() above didn't work. How is it still saying "module has a duplicate import name `wasi_snapshot_preview1:proc_exit` that is not allowed in components"? Maybe trace that and see.
+                        exports.push((name.as_str(), kind, index)); // NEXT: Well, changing to the original name here and in materialize_import() above didn't work. How is it still saying "module has a duplicate import name `wasi_snapshot_preview1:proc_exit` that is not allowed in components"? Maybe trace that and see. // Hey, the core-wasm binary format supports this madness, right? No. In the binary, an import is a string-typed module and field, then a type. Function bodies reference [imported] functions by idx. So can we just satisfy an import of someMod/someField_2 with someMod/someField? Not solely in terms of the core module's binary format, because there's no someField_2 in the module being imported from. Our switcheroo has to have some manifestation within the COMPONENT binary format. And I'm not writing the loader, so don't think in terms of at-load-time switcheroos.
                     }
-                    let index = self.component.core_instantiate_exports(
-                        exports
-                            .iter()
-                            .map(|(name, kind, index)| (name.as_ref(), *kind, *index)),
-                    );
+                    let index = self.component.core_instantiate_exports(exports);
                     args.push((core_wasm_name.as_str(), ModuleArg::Instance(index)));
                 }
 
