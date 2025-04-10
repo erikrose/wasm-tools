@@ -1,4 +1,4 @@
-use crate::encoding::{Instance, Item, LibraryInfo, MainOrAdapter};
+use crate::encoding::{unique_name, Instance, Item, LibraryInfo, MainOrAdapter};
 use crate::{ComponentEncoder, StringEncoding};
 use anyhow::{bail, Context, Result};
 use indexmap::{map::Entry, IndexMap, IndexSet};
@@ -100,9 +100,9 @@ impl ValidatedModule {
 /// A module/name pair that identifies a deeply imported symbol. (It cannot
 /// represent an import satisfied by an ImportInstance::Whole.)
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ImportPath {
-    module: String,
-    name: String,
+pub struct ImportPath {
+    pub module: String,
+    pub name: String,
 }
 
 /// Metadata information about a module's imports.
@@ -116,16 +116,6 @@ pub struct ImportMap {
     /// and the second level of the map is the field namespace. The item is then
     /// how the import is satisfied.
     names: IndexMap<String, ImportInstance>,
-    /// A map of duplicate import module/name pairs to their canonical values.
-    ///
-    /// Core wasm modules allow multiple imports to have the same module/name pair,
-    /// with those imports capable of being disambiguated by index or type, at
-    /// the discretion of the embedder. Components, however, interlink
-    /// only by name, making disambiguation impossible. We thus arbitrarily
-    /// resolve duplicate module/name pairs as pointing to the first of that
-    /// pair.
-    // XXX: This is nonsense. Need $j, $k, … pointing to the canonical $i (or whatever the encoding phase references imports by).
-    //duplicate_names: HashMap<ImportPath, ImportPath>,
 
     /// A map of <A, B>, meaning "Import A should be passed symbol B." For
     /// example, to eliminate duplicate imports of fd_write, this might
@@ -140,7 +130,7 @@ pub struct ImportMap {
     /// only by name, making disambiguation impossible. Thus, we rename all but
     /// the first of any repeated module/name pairs and do some fakery to ensure
     /// they receive equivalent bindings.
-    deduplications: HashMap<ImportPath, ImportPath>,
+    pub deduplications: HashMap<ImportPath, ImportPath>, // TODO: Consider making this non-public.
 }
 
 pub enum ImportInstance {
@@ -206,7 +196,9 @@ impl Hash for PayloadInfo {
 /// The different kinds of items that a module or an adapter can import.
 ///
 /// This is intended to be an exhaustive definition of what can be imported into
-/// core modules within a component that wit-component supports.
+/// core modules within a component that wit-component supports. This doesn't
+/// get down to the level of storing any idx numbers; at its most specific, it
+/// gives a name.
 #[derive(Debug, Clone)]
 pub enum Import {
     /// A top-level world function, with the name provided here, is imported
@@ -510,10 +502,11 @@ impl ImportMap {
         original_path.name.clone()
     }
 
-    /// Helper function used during validation to build up this `ImportMap`.
+    /// Classify an import and call `insert_import()` on it. Used during
+    /// validation to build up this `ImportMap`.
     fn add(
         &mut self,
-        import: wasmparser::Import<'_>,
+        import: wasmparser::Import<'_>, // module/field strs and a type idx
         encoder: &ComponentEncoder,
         library_info: Option<&LibraryInfo>,
         types: TypesRef<'_>,
@@ -530,8 +523,11 @@ impl ImportMap {
         self.insert_import(import, item)
     }
 
-    /// Determines what kind of thing is being imported: map it from the
+    /// Determines what kind of thing is being imported: maps it from the
     /// module/name/type triple in the raw wasm module to an enum.
+    ///
+    /// Handles a few special cases, then delegates to
+    /// `classify_component_model_import()`.
     fn classify(
         &self,
         import: wasmparser::Import<'_>,
@@ -567,7 +563,7 @@ impl ImportMap {
         // Handle main module imports that match known adapters and set it up as
         // an import of an adapter export.
         if encoder.adapters.contains_key(import.module) {
-            return Ok(Import::AdapterExport(ty.clone()));
+            return Ok(Import::AdapterExport(ty.clone())); // This is what classifies my wasip1 dupe funcs.
         }
 
         let (module, names) = match import.module.strip_prefix("cm32p2") {
@@ -750,6 +746,7 @@ impl ImportMap {
         let interface = &resolve.interfaces[id];
         let get_resource = resource_test_for_interface(resolve, id);
         if let Some(f) = interface.functions.get(name) {
+            // I think this is where normal functions end up.
             validate_func(resolve, ty, f, abi).with_context(|| {
                 let name = resolve.name_world_key(&key);
                 format!("failed to validate import interface `{name}`")
@@ -810,6 +807,15 @@ impl ImportMap {
         Ok(true)
     }
 
+    /// Returns the name of a module which will house unique renames of
+    /// duplicatively named imports.
+    // fn deduplicating_module_name(&self) {
+    //     // Find a module name not imported by this module.
+    //     let dedupes_module_name = unique_name("deduplications", |name| {
+    //         import_map.modules().contains_key(name)
+    //     });
+    // }
+
     /// Returns whether this ImportMap has the given import, either originally
     /// or as a new name generated to work around a duplicate.
     ///
@@ -836,34 +842,30 @@ impl ImportMap {
     /// In order to remain both human-readable and deterministic, we keep the
     /// original name if possible and add a suffix if not.
     fn deduplicated_name(&mut self, path: &ImportPath) -> Result<String> {
-        if !self.contains(path) {
-            return Ok(path.name.clone());
+        let name = unique_name(path.name.as_str(), |name| {
+            self.contains(&ImportPath {
+                module: path.module.clone(),
+                name: name.to_string(),
+            })
+        })?;
+        if name != path.name {
+            self.deduplications.insert(
+                ImportPath {
+                    module: path.module.clone(),
+                    name: name.clone(),
+                },
+                path.clone(),
+            );
         }
-        let max_name_length: usize = u32::MAX.try_into()?; // according to wasm spec
-        let mut new_path = path.clone();
-
-        // No particular need to limit this to u32::MAX, but if we had that many
-        // duplicates, I'd rather hear about it and think harder about what to
-        // do.
-        for suffix_number in 0..u32::MAX {
-            new_path.name = format!("{}_{}", path.name, suffix_number);
-            if new_path.name.len() > max_name_length {
-                bail!("exceeded maximum import-name length while searching for a unique name for duplicated import {}::{}.", path.module, path.name);
-            }
-            if !self.contains(&new_path) {
-                self.deduplications.insert(new_path.clone(), path.clone());
-                return Ok(new_path.name);
-            }
-        }
-        bail!(
-            "couldn't find a unique name for duplicated import {}::{}.",
-            path.module,
-            path.name
-        );
+        return Ok(name);
     }
 
+    /// Map an imported item, by module and field name in `self.names`, to the
+    /// kind of `Import` it is: for example, a certain-typed function from an
+    /// adapter.
     fn insert_import(&mut self, import: wasmparser::Import<'_>, item: Import) -> Result<()> {
         let import_module = import.module.to_string();
+        // NEXT: MAYBE (or maybe I'm off track) determine here, before doing anything else, whether it's a dupe import. If it is, access the renamey module throughout rather than the ordinary one.
         let import_instance = self
             .names
             .entry(import_module.clone())
@@ -875,21 +877,20 @@ impl ImportMap {
         let ImportInstance::Names(_) = import_instance else {
             bail!("cannot mix individual imports with module imports");
         };
-        let original_path = ImportPath {
+        let original = ImportPath {
             module: import_module.clone(),
             name: import.name.to_string(),
         };
-        let unique_name = self.deduplicated_name(&original_path)?;
+        let unique_name = self.deduplicated_name(&original)?;
 
         // Redo some of this work from above so deduplicated_name() can borrow self.
-        // TODO: See if this is still necessary now that we're mut borrowing.
         let import_instance = self.names.get_mut(&import_module).unwrap();
         let ImportInstance::Names(names) = import_instance else {
             unreachable!()
         };
         log::trace!(
             "classifying import `{}::{} as {item:?}",
-            import.module,
+            import_module,
             import.name
         );
         names.insert(unique_name, item);

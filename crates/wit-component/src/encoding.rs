@@ -77,7 +77,7 @@ use crate::StringEncoding;
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::{IndexMap, IndexSet};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::mem;
 use wasm_encoder::*;
@@ -580,7 +580,7 @@ impl<'a> EncodingState<'a> {
         // Next instantiate the main module. This provides the linear memory to
         // use for all future adapters and enables creating indirect lowerings
         // at the end.
-        self.instantiate_main_module(&shims)?;
+        self.instantiate_main_module(&shims)?; // idx goes into self.instance_index.
 
         // Separate the adapters according which should be instantiated before
         // and after indirect lowerings are encoded.
@@ -1573,10 +1573,65 @@ impl<'a> EncodingState<'a> {
         shims: &Shims,
         for_module: CustomModule<'_>,
     ) -> Result<u32> {
+        let mut dedupe_module_index = 99u32;
+        if let CustomModule::Main = for_module {
+            // Adapter modules could in principle have duplicate imports, but
+            // they shouldn't: they should be from responsible sources.
+
+            let import_map = &self.info.info.imports;
+            let dedupes_module_name = unique_name("deduplications", |name| {
+                import_map.modules().contains_key(name)
+            });
+            // Map of each duplicate path to its alias idx
+            let mut unique_path_to_alias = HashMap::new();
+            // Avoid creating redundant aliases to the same routines. We reuse
+            // only aliases made here; already-made aliases aren't
+            // readily readable once serialized.
+            let mut aliases = HashMap::new();
+            // Create a (top-level) index entry for each duplicate import, by
+            // means of an alias.
+            for (unique_path, orig_path) in import_map.deduplications.iter() {
+                let adapter_index = match self.adapter_instances.get(orig_path.module.as_str()) {
+                    Some(index) => *index,
+                    None => bail!("no adapter module `{}` found.", orig_path.module), // When this doesn't work, try reversing main_module and adapter instantiation in encode_core_instantiation()
+                };
+                let alias_index = *aliases.entry(orig_path).or_insert_with_key(|orig_path| {
+                    self.component.core_alias_export(
+                        adapter_index,
+                        &orig_path.name,
+                        ExportKind::Func,
+                    )
+                });
+                unique_path_to_alias.insert(unique_path, alias_index);
+            }
+            // Make an empty instance, and add all the aliases to it.
+            if !import_map.deduplications.is_empty() {
+                let mut args = Vec::new();
+                for (unique_path, orig_path) in import_map.deduplications.iter() {
+                    args.push((
+                        unique_path.name.as_str(),
+                        ModuleArg::Instance(*unique_path_to_alias.get(orig_path).unwrap()),
+                    ));
+                }
+                let renames = import_map.deduplications.keys().map(|unique_path| {
+                    (
+                        unique_path.name.as_str(),
+                        ExportKind::Func,
+                        *unique_path_to_alias.get(unique_path).unwrap(),
+                    )
+                });
+                dedupe_module_index = self.component.core_instantiate_exports(renames);
+            }
+            // NEXT: Below, add dedupe_module_index to the args passed to the customer module when we instantiate it (in instantiate_core_module()).
+        }
+
         let module = self.module_for(for_module);
 
         let mut args = Vec::new();
         for (core_wasm_name, instance) in self.info.imports_for(for_module).modules() {
+            // Get the things for_module wants to import.
+            // core_wasm_name is the module name.
+            // instance is an (enum of an) IndexMap holding the import name.
             match instance {
                 // For import modules that are a "bag of names" iterate over
                 // each name and materialize it into this component with the
@@ -1584,9 +1639,12 @@ impl<'a> EncodingState<'a> {
                 // a bag-of-exports instance which is then used for
                 // instantiation.
                 ImportInstance::Names(names) => {
+                    //panic!("Sure the hell got here!");
                     let mut exports = Vec::new();
                     for (name, import) in names {
                         let (kind, index) = self
+                            // PREVIOUSLY: stitch the renamed imports back in. Make it so the original symbol gets piped into them. Where the hell is our ImportMap? It comes flying out of imports_for() above. Yeah, one call to instantiate_core_module() is about just 1 module, so self.info.imports_for(for_module).deduplications is where to look.
+                            // I think, for imports from other modules (rather than adapters), the place to change the name to the de-duped one is either here (`name`) or in `exports.push()` below [not this, I think; I think it's about exports of the importing module].
                             .materialize_import(&shims, for_module, core_wasm_name, name, import)
                             .with_context(|| {
                                 format!("failed to satisfy import `{core_wasm_name}::{name}`")
@@ -1600,6 +1658,7 @@ impl<'a> EncodingState<'a> {
                 // Some imports are entire instances, so use the instance for
                 // the module identifier as the import.
                 ImportInstance::Whole(which) => {
+                    panic!("Didn't expect to get here!");
                     let instance = self.instance_for(which.to_custom_module());
                     args.push((core_wasm_name.as_str(), ModuleArg::Instance(instance)));
                 }
@@ -2875,4 +2934,33 @@ world test {
         assert!(wat.contains("unlocked-dep=<foo:bar/foo@{>=1.0.0 <1.1.0}>"));
         assert!(wat.contains("locked-dep=<foo:bar/i@1.2.3>"));
     }
+}
+
+/// Return a unique wasm `name` for `symbol`, dodging already taken names (for
+/// which `true` is returned by the `is_taken` predicate).
+pub fn unique_name<F>(symbol: &str, is_taken: F) -> Result<String>
+where
+    F: Fn(&str) -> bool,
+{
+    if !is_taken(symbol) {
+        return Ok(symbol.to_string());
+    }
+    let max_name_length: usize = u32::MAX.try_into()?; // according to wasm spec
+
+    // No particular need to limit this to u32::MAX, but if we had that many
+    // duplicates, I'd rather hear about it and think harder about what to
+    // do.
+    for suffix_number in 0..u32::MAX {
+        let ret = format!("{}_{}", symbol, suffix_number);
+        if ret.len() > max_name_length {
+            bail!(
+                "exceeded maximum name length while searching for a unique name for {}.",
+                symbol
+            );
+        }
+        if !is_taken(&ret) {
+            return Ok(ret);
+        }
+    }
+    bail!("couldn't find a unique name for {}.", symbol);
 }

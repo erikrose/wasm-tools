@@ -99,7 +99,11 @@ impl<'a> ComponentWorld<'a> {
             },
         ) in self.encoder.adapters.iter()
         {
+            // This is probably a good place to have it respect the dedupe map: require only fd_write, not fd_write_0, for instance. Could also do it a level deeper, in validate_adapter_module(), but why indirect further? I am its only caller. Plus I like not messing with a validation function; making the module valid as early as possible is a virtue, and that means here.
             let required_by_import = self.info.imports.required_from_adapter(name.as_str());
+            // Set required_by_import to elide ones from `deduplications` (iff I make deduplications hold only duplicates, never A -> A).
+            // Algo: .filter(|n| !self.info.imports.contains_duplicate(n))
+
             // Don't require things like fd_write_0: only the original names.
             let no_required_by_import = || required_by_import.is_empty();
             let no_required_exports = || {
