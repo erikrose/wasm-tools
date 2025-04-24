@@ -1522,6 +1522,7 @@ impl<'a> EncodingState<'a> {
 
         let mut args = Vec::new();
         for (core_wasm_name, instance) in self.info.imports_for(for_module).modules() {
+            //over raw names. Don't even deal with renaming in here. No one but classify() should have to care about renamings.
             match instance {
                 // For import modules that are a "bag of names" iterate over
                 // each name and materialize it into this component with the
@@ -1565,8 +1566,8 @@ impl<'a> EncodingState<'a> {
         &mut self,
         shims: &Shims<'_>,
         for_module: CustomModule<'_>,
-        module: &str,
-        field: &str,
+        module: &str, //die
+        field: &str,  //die
         import: &'a Import,
     ) -> Result<(ExportKind, u32)> {
         log::trace!("attempting to materialize import of `{module}::{field}` for {for_module:?}");
@@ -1575,8 +1576,10 @@ impl<'a> EncodingState<'a> {
             // Main module dependencies on an adapter in use are done with an
             // indirection here, so load the shim function and use that.
             Import::AdapterExport(_) => {
+                // yank field name outta here
                 assert!(self.info.encoder.adapters.contains_key(module));
                 Ok(self.materialize_shim_import(
+                    // It should materialize the dupe'd import twice (inherently).
                     shims,
                     &ShimKind::Adapter {
                         adapter: module,

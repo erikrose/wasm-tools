@@ -437,7 +437,7 @@ impl ImportMap {
         self.names
             .iter()
             .filter_map(|(module, m)| match m {
-                ImportInstance::Names(names) => Some((module, names)),
+                ImportInstance::Names(names) => Some((module, names)), //
                 ImportInstance::Whole(_) => None,
             })
             .flat_map(|(module, m)| {
@@ -463,12 +463,14 @@ impl ImportMap {
         if self.classify_import_with_library(import, library_info)? {
             return Ok(());
         }
+        // Rename the things.
         let item = self.classify(import, encoder, types).with_context(|| {
             format!(
                 "failed to resolve import `{}::{}`",
                 import.module, import.name,
             )
         })?;
+        // Do not rename here:
         self.insert_import(import, item)
     }
 
@@ -479,7 +481,7 @@ impl ImportMap {
     /// `classify_component_model_import()`.
     fn classify(
         &self,
-        import: wasmparser::Import<'_>,
+        import: wasmparser::Import<'_>, // Don't look at raw module name; look at renaming. Should add a name (the new, unique name) to AdapterExport. Maybe this should take module/name/type instead of `import` and the sole caller (add()) should do the remapping.
         encoder: &ComponentEncoder,
         types: TypesRef<'_>,
     ) -> Result<Import> {
@@ -512,6 +514,7 @@ impl ImportMap {
         // Handle main module imports that match known adapters and set it up as
         // an import of an adapter export.
         if encoder.adapters.contains_key(import.module) {
+            // direct imports of funcs from adapters
             return Ok(Import::AdapterExport(ty.clone()));
         }
 
