@@ -1532,8 +1532,9 @@ impl<'a> EncodingState<'a> {
                 ImportInstance::Names(names) => {
                     let mut exports = Vec::new();
                     for (name, import) in names {
+                        log::trace!("attempting to materialize import of `{core_wasm_name}::{name}` for {for_module:?}");
                         let (kind, index) = self
-                            .materialize_import(&shims, for_module, core_wasm_name, name, import)
+                            .materialize_import(&shims, for_module, import)
                             .with_context(|| {
                                 format!("failed to satisfy import `{core_wasm_name}::{name}`")
                             })?;
@@ -1566,20 +1567,16 @@ impl<'a> EncodingState<'a> {
         &mut self,
         shims: &Shims<'_>,
         for_module: CustomModule<'_>,
-        module: &str, //die
-        field: &str,  //die
         import: &'a Import,
     ) -> Result<(ExportKind, u32)> {
-        log::trace!("attempting to materialize import of `{module}::{field}` for {for_module:?}");
         let resolve = &self.info.encoder.metadata.resolve;
         match import {
             // Main module dependencies on an adapter in use are done with an
             // indirection here, so load the shim function and use that.
-            Import::AdapterExport(_) => {
-                // yank field name outta here
+            Import::AdapterExport { module, field, .. } => {
                 assert!(self.info.encoder.adapters.contains_key(module));
                 Ok(self.materialize_shim_import(
-                    // It should materialize the dupe'd import twice (inherently).
+                    // It should materialize the dupe'd import twice (inherently). [I am skeptical of this; materialize_shim_import assumes the name of the thing it's importing from the shim is the name we pass in here.]
                     shims,
                     &ShimKind::Adapter {
                         adapter: module,
@@ -2373,7 +2370,7 @@ impl<'a> Shims<'a> {
 
                 // Adapter imports into the main module must got through an
                 // indirection, so that's registered here.
-                Import::AdapterExport(ty) => {
+                Import::AdapterExport { ty, .. } => {
                     let name = self.shims.len().to_string();
                     log::debug!("shim {name} is adapter `{module}::{field}`");
                     self.push(Shim {

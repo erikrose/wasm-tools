@@ -2,6 +2,7 @@ use crate::encoding::{Instance, Item, LibraryInfo, MainOrAdapter};
 use crate::{ComponentEncoder, StringEncoding};
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::{map::Entry, IndexMap, IndexSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::mem;
 use wasm_encoder::ExportKind;
@@ -95,6 +96,13 @@ impl ValidatedModule {
     }
 }
 
+/// A module/name pair that identifies a deeply imported symbol. (It cannot
+/// represent an import satisfied by an ImportInstance::Whole.)
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportPath {
+    module: String,
+    field: String,
+}
 /// Metadata information about a module's imports.
 ///
 /// This structure maintains the connection between component model "things" and
@@ -106,6 +114,21 @@ pub struct ImportMap {
     /// and the second level of the map is the field namespace. The item is then
     /// how the import is satisfied.
     names: IndexMap<String, ImportInstance>,
+
+    /// A map of <A, B>, meaning "Import A should be passed symbol B." For
+    /// example, to eliminate duplicate imports of fd_write, this might
+    /// contain...
+    ///
+    ///     ("wasi_snapshot_preview1", "fd_write" )  -> ("wasi_snapshot_preview1", "fd_write")
+    ///     ("wasi_snapshot_preview1", "fd_write_2") -> ("wasi_snapshot_preview1", "fd_write")
+    ///
+    /// Core wasm modules allow multiple imports to have the same module/name pair,
+    /// with those imports capable of being disambiguated by index or type, at
+    /// the discretion of the embedder. Components, however, interlink
+    /// only by name, making disambiguation impossible. Thus, we rename all but
+    /// the first of any repeated module/name pairs and do some fakery to ensure
+    /// they receive equivalent bindings.
+    deduplications: HashMap<ImportPath, ImportPath>,
 }
 
 pub enum ImportInstance {
@@ -228,9 +251,12 @@ pub enum Import {
     /// An export of an adapter is being imported with the specified type.
     ///
     /// This is used for when the main module imports an adapter function. The
-    /// adapter name and function name match the module's own import, and the
     /// type must match that listed here.
-    AdapterExport(FuncType),
+    AdapterExport {
+        module: String,
+        field: String,
+        ty: FuncType,
+    },
 
     /// An adapter is importing the memory of the main module.
     ///
@@ -422,7 +448,7 @@ impl ImportMap {
                 (
                     name.clone(),
                     match import {
-                        Import::AdapterExport(ty) => ty.clone(),
+                        Import::AdapterExport { ty, .. } => ty.clone(),
                         _ => unreachable!(),
                     },
                 )
@@ -451,6 +477,50 @@ impl ImportMap {
         &self.names
     }
 
+    /// Returns whether the given import path represents a new name generated to
+    /// avoid a duplicate name.
+    fn contains_duplicate(&self, path: &ImportPath) -> bool {
+        self.deduplications.contains_key(path)
+    }
+
+    /// Returns whether this ImportMap has the given import, either originally
+    /// or as a new name generated to work around a duplicate.
+    ///
+    /// No "whole instance" imports can contribute to a true result from this,
+    /// since ImportPaths have no way to refer to them.
+    fn contains(&self, path: &ImportPath) -> bool {
+        let contains_non_duplicate = match self.names.get(&path.module) {
+            None | Some(ImportInstance::Whole(_)) => false,
+            Some(ImportInstance::Names(fields)) => fields.contains_key(&path.field),
+        };
+        self.contains_duplicate(&path) || contains_non_duplicate
+    }
+
+    /// Renders a module/name pair unique in this ImportMap by coming up with a
+    /// new name if necessary. If a new name is made, it is added to
+    /// self.deduplications.
+    ///
+    /// In order to remain both human-readable and deterministic, we keep the
+    /// original name if possible and add a suffix if not.
+    fn deduplicated_name(&mut self, path: &ImportPath) -> Result<String> {
+        let field = unique_name(path.field.as_str(), |name| {
+            self.contains(&ImportPath {
+                module: path.module.clone(),
+                field: name.to_string(),
+            })
+        })?;
+        if field != path.field {
+            self.deduplications.insert(
+                ImportPath {
+                    module: path.module.clone(),
+                    field: field.clone(),
+                },
+                path.clone(),
+            );
+        }
+        return Ok(field);
+    }
+
     /// Classify an import and call `insert_import()` on it. Used during
     /// validation to build up this `ImportMap`.
     fn add(
@@ -464,12 +534,21 @@ impl ImportMap {
             return Ok(());
         }
         // Rename the things.
-        let item = self.classify(import, encoder, types).with_context(|| {
-            format!(
-                "failed to resolve import `{}::{}`",
-                import.module, import.name,
-            )
+        // If the incoming import is a dupe, come up with a new name.
+        // Pass it to classify() so it can squirrel it into AdapterExport.
+        let unique_name = self.deduplicated_name(&ImportPath {
+            module: import.module.to_string(),
+            field: import.name.to_string(),
         })?;
+
+        let item = self
+            .classify(import.module, &unique_name, import.ty, encoder, types)
+            .with_context(|| {
+                format!(
+                    "failed to resolve import `{}::{}`",
+                    import.module, import.name,
+                )
+            })?;
         // Do not rename here:
         self.insert_import(import, item)
     }
@@ -481,21 +560,24 @@ impl ImportMap {
     /// `classify_component_model_import()`.
     fn classify(
         &self,
-        import: wasmparser::Import<'_>, // Don't look at raw module name; look at renaming. Should add a name (the new, unique name) to AdapterExport. Maybe this should take module/name/type instead of `import` and the sole caller (add()) should do the remapping.
+        module: &str,
+        name: &str,
+        ty: TypeRef,
+        //import: wasmparser::Import<'_>, // Don't look at raw module name; look at renaming. Should add a name (the new, unique name) to AdapterExport. Maybe this should take module/name/type instead of `import` and the sole caller (add()) should do the remapping.
         encoder: &ComponentEncoder,
         types: TypesRef<'_>,
     ) -> Result<Import> {
         // Special-case the main module's memory imported into adapters which
         // currently with `wasm-ld` is not easily configurable.
-        if import.module == "env" && import.name == "memory" {
+        if module == "env" && name == "memory" {
             return Ok(Import::MainModuleMemory);
         }
 
         // Special-case imports from the main module into adapters.
-        if import.module == "__main_module__" {
+        if module == "__main_module__" {
             return Ok(Import::MainModuleExport {
-                name: import.name.to_string(),
-                kind: match import.ty {
+                name: name.to_string(),
+                kind: match ty {
                     TypeRef::Func(_) => ExportKind::Func,
                     TypeRef::Table(_) => ExportKind::Table,
                     TypeRef::Memory(_) => ExportKind::Memory,
@@ -505,7 +587,7 @@ impl ImportMap {
             });
         }
 
-        let ty_index = match import.ty {
+        let ty_index = match ty {
             TypeRef::Func(ty) => ty,
             _ => bail!("module is only allowed to import functions"),
         };
@@ -513,17 +595,21 @@ impl ImportMap {
 
         // Handle main module imports that match known adapters and set it up as
         // an import of an adapter export.
-        if encoder.adapters.contains_key(import.module) {
+        if encoder.adapters.contains_key(module) {
             // direct imports of funcs from adapters
-            return Ok(Import::AdapterExport(ty.clone()));
+            return Ok(Import::AdapterExport {
+                module: module.to_string(),
+                field: name.to_string(),
+                ty: ty.clone(),
+            });
         }
 
-        let (module, names) = match import.module.strip_prefix("cm32p2") {
+        let (module, names) = match module.strip_prefix("cm32p2") {
             Some(suffix) => (suffix, STANDARD),
-            None if encoder.reject_legacy_names => (import.module, STANDARD),
-            None => (import.module, LEGACY),
+            None if encoder.reject_legacy_names => (module, STANDARD),
+            None => (module, LEGACY),
         };
-        self.classify_component_model_import(module, import.name, encoder, ty, names)
+        self.classify_component_model_import(module, name, encoder, ty, names)
     }
 
     /// Attempts to classify the import `{module}::{name}` with the rules
@@ -2109,4 +2195,33 @@ fn get_function<'a>(
         bail!("no export `{name}` found");
     };
     Ok(function)
+}
+
+/// Return a unique wasm `name` for `symbol`, dodging already taken names (for
+/// which `true` is returned by the `is_taken` predicate).
+pub fn unique_name<F>(symbol: &str, is_taken: F) -> Result<String>
+where
+    F: Fn(&str) -> bool,
+{
+    if !is_taken(symbol) {
+        return Ok(symbol.to_string());
+    }
+    let max_name_length: usize = u32::MAX.try_into()?; // according to wasm spec
+
+    // No particular need to limit this to u32::MAX, but if we had that many
+    // duplicates, I'd rather hear about it and think harder about what to
+    // do.
+    for suffix_number in 0..u32::MAX {
+        let ret = format!("{}_{}", symbol, suffix_number);
+        if ret.len() > max_name_length {
+            bail!(
+                "exceeded maximum name length while searching for a unique name for {}.",
+                symbol
+            );
+        }
+        if !is_taken(&ret) {
+            return Ok(ret);
+        }
+    }
+    bail!("couldn't find a unique name for {}.", symbol);
 }

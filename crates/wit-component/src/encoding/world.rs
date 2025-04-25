@@ -408,7 +408,7 @@ impl<'a> ComponentWorld<'a> {
 
                 // Intrinsics that don't need to refer to WIT types can be
                 // skipped here.
-                Import::AdapterExport(_)
+                Import::AdapterExport { .. }
                 | Import::MainModuleMemory
                 | Import::MainModuleExport { .. }
                 | Import::Item(_)
