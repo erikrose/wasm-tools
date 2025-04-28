@@ -1091,16 +1091,17 @@ impl ImportMap {
         };
         let entry = match names.entry(import.name.to_string()) {
             Entry::Occupied(_) => {
-                bail!(
-                    "module has duplicate import for `{}::{}`",
+                log::trace!(
+                    "skipping classification of duplicate import `{}::{}`",
                     import.module,
                     import.name
                 );
+                return Ok(());
             }
             Entry::Vacant(v) => v,
         };
         log::trace!(
-            "classifying import `{}::{} as {item:?}",
+            "classifying import `{}::{}` as {item:?}",
             import.module,
             import.name
         );
