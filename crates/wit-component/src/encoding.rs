@@ -1521,7 +1521,9 @@ impl<'a> EncodingState<'a> {
         let module = self.module_for(for_module);
 
         let mut args = Vec::new();
-        for (core_wasm_name, instance) in self.info.imports_for(for_module).modules() {
+        let import_map = self.info.imports_for(for_module);
+        // For each module this module imports:
+        for (core_wasm_name, instance) in import_map.modules() {
             //over raw names. Don't even deal with renaming in here. No one but classify() should have to care about renamings.
             match instance {
                 // For import modules that are a "bag of names" iterate over
@@ -1531,16 +1533,33 @@ impl<'a> EncodingState<'a> {
                 // instantiation.
                 ImportInstance::Names(names) => {
                     let mut exports = Vec::new();
+                    // For all the fields imported from this imported module:
                     for (name, import) in names {
                         log::trace!("attempting to materialize import of `{core_wasm_name}::{name}` for {for_module:?}");
+                        let original_import = match import {
+                            Import::AdapterExport { module, field, ty } => Import::AdapterExport {
+                                module: module.to_string(),
+                                field: import_map
+                                    .original_name(module.to_string(), field.to_string()),
+                                ty: ty.clone(),
+                            },
+                            _ => import.clone(),
+                        };
                         let (kind, index) = self
-                            .materialize_import(&shims, for_module, import)
+                            .materialize_import(&shims, for_module, original_import)
                             .with_context(|| {
                                 format!("failed to satisfy import `{core_wasm_name}::{name}`")
                             })?;
-                        exports.push((name.as_str(), kind, index));
+                        exports.push((name.to_string(), kind, index));
                     }
-                    let index = self.component.core_instantiate_exports(exports);
+                    for (s, _, i) in exports.clone() {
+                        log::trace!("pushing `{}` onto exports, referencing index {}", s, i)
+                    }
+                    // Make the instance that's about to satisfy the import:
+                    let index = self.component.core_instantiate_exports(
+                        exports.iter().map(|(s, e, i)| (s.as_str(), *e, *i)),
+                    );
+                    // "Here, for the module of this name being imported, use this instance."
                     args.push((core_wasm_name.as_str(), ModuleArg::Instance(index)));
                 }
 
@@ -1567,20 +1586,21 @@ impl<'a> EncodingState<'a> {
         &mut self,
         shims: &Shims<'_>,
         for_module: CustomModule<'_>,
-        import: &'a Import,
+        import: Import,
     ) -> Result<(ExportKind, u32)> {
         let resolve = &self.info.encoder.metadata.resolve;
         match import {
             // Main module dependencies on an adapter in use are done with an
             // indirection here, so load the shim function and use that.
             Import::AdapterExport { module, field, .. } => {
-                assert!(self.info.encoder.adapters.contains_key(module));
+                assert!(self.info.encoder.adapters.contains_key(&module));
+                log::trace!("materializing import {}", field);
                 Ok(self.materialize_shim_import(
                     // It should materialize the dupe'd import twice (inherently). [I am skeptical of this; materialize_shim_import assumes the name of the thing it's importing from the shim is the name we pass in here.]
                     shims,
                     &ShimKind::Adapter {
-                        adapter: module,
-                        func: field,
+                        adapter: module.as_str(),
+                        func: field.as_str(),
                     },
                 ))
             }
@@ -1597,8 +1617,8 @@ impl<'a> EncodingState<'a> {
             // Grab-bag of "this adapter wants this thing from the main module".
             Import::MainModuleExport { name, kind } => {
                 let instance = self.instance_index.unwrap();
-                let index = self.core_alias_export(instance, name, *kind);
-                Ok((*kind, index))
+                let index = self.core_alias_export(instance, name.as_str(), kind);
+                Ok((kind, index))
             }
 
             // A similar grab-bag to above but with a slightly different
@@ -1616,15 +1636,15 @@ impl<'a> EncodingState<'a> {
             // handled here using the resource types created during
             // `declare_types_for_imported_intrinsics` above.
             Import::ExportedResourceDrop(_key, id) => {
-                let index = self.component.resource_drop(self.export_type_map[id]);
+                let index = self.component.resource_drop(self.export_type_map[&id]);
                 Ok((ExportKind::Func, index))
             }
             Import::ExportedResourceRep(_key, id) => {
-                let index = self.component.resource_rep(self.export_type_map[id]);
+                let index = self.component.resource_rep(self.export_type_map[&id]);
                 Ok((ExportKind::Func, index))
             }
             Import::ExportedResourceNew(_key, id) => {
-                let index = self.component.resource_new(self.export_type_map[id]);
+                let index = self.component.resource_new(self.export_type_map[&id]);
                 Ok((ExportKind::Func, index))
             }
 
@@ -1633,19 +1653,19 @@ impl<'a> EncodingState<'a> {
             // WIT `ImportedInterface` one way or another with the name that was
             // detected during validation.
             Import::ImportedResourceDrop(key, iface, id) => {
-                let ty = &resolve.types[*id];
+                let ty = &resolve.types[id];
                 let name = ty.name.as_ref().unwrap();
                 self.materialize_wit_import(
                     shims,
                     for_module,
-                    iface.map(|_| resolve.name_world_key(key)),
+                    iface.map(|_| resolve.name_world_key(&key)),
                     &format!("{name}_drop"),
-                    key,
+                    &key,
                     AbiVariant::GuestImport,
                 )
             }
             Import::ExportedTaskReturn(key, interface, func, result) => {
-                let (options, _sig) = task_return_options_and_type(resolve, *result);
+                let (options, _sig) = task_return_options_and_type(resolve, result);
                 if options.is_empty() {
                     // Note that an "import type encoder" is used here despite
                     // this being for an exported function if the `interface`
@@ -1653,27 +1673,30 @@ impl<'a> EncodingState<'a> {
                     // function. In that situation all types that can be
                     // referred to are imported, not exported.
                     let mut encoder = if interface.is_none() {
-                        self.root_import_type_encoder(*interface)
+                        self.root_import_type_encoder(interface)
                     } else {
-                        self.root_export_type_encoder(*interface)
+                        self.root_export_type_encoder(interface)
                     };
 
                     let result = match result {
-                        Some(ty) => Some(encoder.encode_valtype(resolve, ty)?),
+                        Some(ty) => Some(encoder.encode_valtype(resolve, &ty)?),
                         None => None,
                     };
                     let index = self.component.task_return(result, []);
                     Ok((ExportKind::Func, index))
                 } else {
                     let metadata = &self.info.encoder.metadata.metadata;
-                    let encoding = metadata.export_encodings.get(resolve, key, func).unwrap();
+                    let encoding = metadata
+                        .export_encodings
+                        .get(resolve, &key, func.as_str())
+                        .unwrap();
                     Ok(self.materialize_shim_import(
                         shims,
                         &ShimKind::TaskReturn {
                             for_module,
-                            interface: *interface,
-                            func,
-                            result: *result,
+                            interface: interface,
+                            func: func.as_str(),
+                            result,
                             encoding,
                         },
                     ))
@@ -1685,14 +1708,14 @@ impl<'a> EncodingState<'a> {
             }
             Import::WaitableSetWait { async_ } => {
                 Ok(self
-                    .materialize_shim_import(shims, &ShimKind::WaitableSetWait { async_: *async_ }))
+                    .materialize_shim_import(shims, &ShimKind::WaitableSetWait { async_: async_ }))
             }
             Import::WaitableSetPoll { async_ } => {
                 Ok(self
-                    .materialize_shim_import(shims, &ShimKind::WaitableSetPoll { async_: *async_ }))
+                    .materialize_shim_import(shims, &ShimKind::WaitableSetPoll { async_: async_ }))
             }
             Import::Yield { async_ } => {
-                let index = self.component.yield_(*async_);
+                let index = self.component.yield_(async_);
                 Ok((ExportKind::Func, index))
             }
             Import::SubtaskDrop => {
@@ -1700,94 +1723,91 @@ impl<'a> EncodingState<'a> {
                 Ok((ExportKind::Func, index))
             }
             Import::SubtaskCancel { async_ } => {
-                let index = self.component.subtask_cancel(*async_);
+                let index = self.component.subtask_cancel(async_);
                 Ok((ExportKind::Func, index))
             }
             Import::StreamNew(info) => {
-                let ty = self.payload_type_index(info)?;
+                let ty = self.payload_type_index(&info)?;
                 let index = self.component.stream_new(ty);
                 Ok((ExportKind::Func, index))
             }
             Import::StreamRead { info, .. } => Ok(self.materialize_payload_import(
                 shims,
                 for_module,
-                info,
+                &info,
                 PayloadFuncKind::StreamRead,
             )),
             Import::StreamWrite { info, .. } => Ok(self.materialize_payload_import(
                 shims,
                 for_module,
-                info,
+                &info,
                 PayloadFuncKind::StreamWrite,
             )),
             Import::StreamCancelRead { info, async_ } => {
-                let ty = self.payload_type_index(info)?;
-                let index = self.component.stream_cancel_read(ty, *async_);
+                let ty = self.payload_type_index(&info)?;
+                let index = self.component.stream_cancel_read(ty, async_);
                 Ok((ExportKind::Func, index))
             }
             Import::StreamCancelWrite { info, async_ } => {
-                let ty = self.payload_type_index(info)?;
-                let index = self.component.stream_cancel_write(ty, *async_);
+                let ty = self.payload_type_index(&info)?;
+                let index = self.component.stream_cancel_write(ty, async_);
                 Ok((ExportKind::Func, index))
             }
             Import::StreamCloseReadable(info) => {
-                let type_index = self.payload_type_index(info)?;
+                let type_index = self.payload_type_index(&info)?;
                 let index = self.component.stream_close_readable(type_index);
                 Ok((ExportKind::Func, index))
             }
             Import::StreamCloseWritable(info) => {
-                let type_index = self.payload_type_index(info)?;
+                let type_index = self.payload_type_index(&info)?;
                 let index = self.component.stream_close_writable(type_index);
                 Ok((ExportKind::Func, index))
             }
             Import::FutureNew(info) => {
-                let ty = self.payload_type_index(info)?;
+                let ty = self.payload_type_index(&info)?;
                 let index = self.component.future_new(ty);
                 Ok((ExportKind::Func, index))
             }
             Import::FutureRead { info, .. } => Ok(self.materialize_payload_import(
                 shims,
                 for_module,
-                info,
+                &info,
                 PayloadFuncKind::FutureRead,
             )),
             Import::FutureWrite { info, .. } => Ok(self.materialize_payload_import(
                 shims,
                 for_module,
-                info,
+                &info,
                 PayloadFuncKind::FutureWrite,
             )),
             Import::FutureCancelRead { info, async_ } => {
-                let ty = self.payload_type_index(info)?;
-                let index = self.component.future_cancel_read(ty, *async_);
+                let ty = self.payload_type_index(&info)?;
+                let index = self.component.future_cancel_read(ty, async_);
                 Ok((ExportKind::Func, index))
             }
             Import::FutureCancelWrite { info, async_ } => {
-                let ty = self.payload_type_index(info)?;
-                let index = self.component.future_cancel_write(ty, *async_);
+                let ty = self.payload_type_index(&info)?;
+                let index = self.component.future_cancel_write(ty, async_);
                 Ok((ExportKind::Func, index))
             }
             Import::FutureCloseReadable(info) => {
-                let type_index = self.payload_type_index(info)?;
+                let type_index = self.payload_type_index(&info)?;
                 let index = self.component.future_close_readable(type_index);
                 Ok((ExportKind::Func, index))
             }
             Import::FutureCloseWritable(info) => {
-                let type_index = self.payload_type_index(info)?;
+                let type_index = self.payload_type_index(&info)?;
                 let index = self.component.future_close_writable(type_index);
                 Ok((ExportKind::Func, index))
             }
-            Import::ErrorContextNew { encoding } => Ok(self.materialize_shim_import(
-                shims,
-                &ShimKind::ErrorContextNew {
-                    encoding: *encoding,
-                },
-            )),
+            Import::ErrorContextNew { encoding } => {
+                Ok(self.materialize_shim_import(shims, &ShimKind::ErrorContextNew { encoding }))
+            }
             Import::ErrorContextDebugMessage { encoding } => Ok(self.materialize_shim_import(
                 shims,
                 &ShimKind::ErrorContextDebugMessage {
                     for_module,
-                    encoding: *encoding,
+                    encoding,
                 },
             )),
             Import::ErrorContextDrop => {
@@ -1795,15 +1815,15 @@ impl<'a> EncodingState<'a> {
                 Ok((ExportKind::Func, index))
             }
             Import::WorldFunc(key, name, abi) => {
-                self.materialize_wit_import(shims, for_module, None, name, key, *abi)
+                self.materialize_wit_import(shims, for_module, None, &name, &key, abi)
             }
             Import::InterfaceFunc(key, _, name, abi) => self.materialize_wit_import(
                 shims,
                 for_module,
-                Some(resolve.name_world_key(key)),
-                name,
-                key,
-                *abi,
+                Some(resolve.name_world_key(&key)),
+                &name,
+                &key,
+                abi,
             ),
 
             Import::WaitableSetNew => {
@@ -1819,11 +1839,11 @@ impl<'a> EncodingState<'a> {
                 Ok((ExportKind::Func, index))
             }
             Import::ContextGet(n) => {
-                let index = self.component.context_get(*n);
+                let index = self.component.context_get(n);
                 Ok((ExportKind::Func, index))
             }
             Import::ContextSet(n) => {
-                let index = self.component.context_set(*n);
+                let index = self.component.context_set(n);
                 Ok((ExportKind::Func, index))
             }
             Import::ExportedTaskCancel => {
@@ -1834,12 +1854,13 @@ impl<'a> EncodingState<'a> {
     }
 
     /// Helper for `materialize_import` above for materializing functions that
-    /// are part of the "shim module" generated.
+    /// are part of the "shim module" generated. Here's where the aliases are generated.
     fn materialize_shim_import(&mut self, shims: &Shims<'_>, kind: &ShimKind) -> (ExportKind, u32) {
+        //log::trace!("materializing shim import {}", )
         let index = self.core_alias_export(
             self.shim_instance_index
                 .expect("shim should be instantiated"),
-            &shims.shims[kind].name,
+            &shims.shims[kind].name, // This will be something like "0", "1", etc. but should be parallel to the original name, not a dedupe. (The name going into the alias answers "What do you want me to alias out of that instance?")
             ExportKind::Func,
         );
         (ExportKind::Func, index)

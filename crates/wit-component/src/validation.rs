@@ -254,7 +254,7 @@ pub enum Import {
     /// type must match that listed here.
     AdapterExport {
         module: String,
-        field: String,
+        field: String, // the unique-ified name in case of duplicate imports
         ty: FuncType,
     },
 
@@ -521,6 +521,14 @@ impl ImportMap {
         return Ok(field);
     }
 
+    /// Return the original name of a deduplicated import path or, if `path` was
+    /// not the result of a deduplication, `path.name` unchanged.
+    pub fn original_name(&self, module: String, field: String) -> String {
+        let path = ImportPath { module, field };
+        let original_path = self.deduplications.get(&path).unwrap_or(&path);
+        original_path.field.clone()
+    }
+
     /// Classify an import and call `insert_import()` on it. Used during
     /// validation to build up this `ImportMap`.
     fn add(
@@ -549,8 +557,10 @@ impl ImportMap {
                     import.module, import.name,
                 )
             })?;
-        // Do not rename here:
-        self.insert_import(import, item)
+        // Do not rename here: [nah, I think we need to so instantiate_core_module() can then satisfy it using an alias named proc_exit_0.)
+        let mut unique_import = import.clone();
+        unique_import.name = &unique_name;
+        self.insert_import(unique_import, item)
     }
 
     /// Determines what kind of thing is being imported: maps it from the
@@ -1090,6 +1100,7 @@ impl ImportMap {
             _ => bail!("cannot mix individual imports with module imports"),
         };
         let entry = match names.entry(import.name.to_string()) {
+            // We cannot skip classifying the duplicate import, because then it never gets into self.names, and it's self.names that instantiate_core_module() loops over when materializing imports. Fixed: add() now passes this only unique names, including deduplicated names like fd_write_0.
             Entry::Occupied(_) => {
                 log::trace!(
                     "skipping classification of duplicate import `{}::{}`",
@@ -2221,6 +2232,7 @@ where
             );
         }
         if !is_taken(&ret) {
+            log::trace!("created a unique import name `{}` for `{}`", ret, symbol);
             return Ok(ret);
         }
     }
